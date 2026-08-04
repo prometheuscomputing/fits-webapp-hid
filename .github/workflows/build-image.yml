@@ -48,6 +48,33 @@ jobs:
                 <url>https://nexus.valitheus.com/repository/public/</url>
               </mirror>
             </mirrors>
+            <!-- redefine central with snapshots enabled: several of our own
+                 artifacts (fhirLib, the igamt-lite siblings) live in the
+                 snapshots repo, and stock central would never ask for them -->
+            <profiles>
+              <profile>
+                <id>nexus</id>
+                <repositories>
+                  <repository>
+                    <id>central</id>
+                    <url>https://nexus.valitheus.com/repository/public/</url>
+                    <releases><enabled>true</enabled></releases>
+                    <snapshots><enabled>true</enabled></snapshots>
+                  </repository>
+                </repositories>
+                <pluginRepositories>
+                  <pluginRepository>
+                    <id>central</id>
+                    <url>https://nexus.valitheus.com/repository/public/</url>
+                    <releases><enabled>true</enabled></releases>
+                    <snapshots><enabled>true</enabled></snapshots>
+                  </pluginRepository>
+                </pluginRepositories>
+              </profile>
+            </profiles>
+            <activeProfiles>
+              <activeProfile>nexus</activeProfile>
+            </activeProfiles>
           </settings>
           XML
 
