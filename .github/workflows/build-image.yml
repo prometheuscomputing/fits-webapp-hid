@@ -1,0 +1,159 @@
+# Builds the FITS webapp image from source and parks it in ECR as a deploy
+# candidate. The running service follows the :latest tag, which this workflow
+# never writes — promotion to :latest happens from Mission Control after a
+# human approves the candidate, so a push here can never change what runs
+# by itself. Full flow: aws-migration repo, docs/FITS_CICD_SPEC.md.
+
+name: build-image
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  id-token: write # lets the job assume the AWS role via OIDC; no stored keys
+  contents: read
+
+concurrency:
+  group: build-image
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-2
+  ECR_REPO: 708499050170.dkr.ecr.us-east-2.amazonaws.com/healthit/fits1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cds-tcamt
+    steps:
+      - uses: actions/checkout@v4
+
+      # All Maven traffic goes through our Nexus (anonymous read). The
+      # mirrorOf=* also overrides the hardcoded repository URLs some of
+      # these poms still carry from their previous home.
+      - name: maven settings
+        working-directory: .
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<'XML'
+          <settings>
+            <mirrors>
+              <mirror>
+                <id>nexus</id>
+                <mirrorOf>*</mirrorOf>
+                <url>https://nexus.valitheus.com/repository/public/</url>
+              </mirror>
+            </mirrors>
+          </settings>
+          XML
+
+      - name: cache maven repo
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: m2-
+
+      - name: cache client toolchain
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: client-${{ hashFiles('cds-tcamt/cds-tcamt-client/package.json', 'cds-tcamt/cds-tcamt-client/bower.json') }}
+          restore-keys: client-
+
+      # The DAP include reports usage to the federal analytics program and
+      # has no place on our hosting. Strip it from the sources before the
+      # client build so no build output can carry it.
+      - name: strip analytics
+        run: |
+          for f in cds-tcamt-client/app/index.html cds-tcamt-client/app/prod/index.html; do
+            sed -i -e '/dap\.digitalgov\.gov/d' \
+                   -e '/googletagmanager\.com\/gtag/d' \
+                   -e '/gtag-init/d' "$f"
+          done
+          if grep -RIl "digitalgov\|googletagmanager" cds-tcamt-client/app; then
+            echo "analytics include still present after strip" >&2
+            exit 1
+          fi
+
+      # Angular client. grunt 0.4 / graceful-fs@3 breaks on newer node
+      # ("primordials is not defined") so this needs node 10, and the sass
+      # toolchain needs the pinned ruby gems. Same container recipe the
+      # local builds use.
+      - name: build client
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.cache/npm" "$GITHUB_WORKSPACE/.cache/bower" "$GITHUB_WORKSPACE/.cache/gems"
+          docker run --rm \
+            -e CI=true -e PHANTOMJS_SKIP_DOWNLOAD=true \
+            -e NPM_CONFIG_CACHE=/cache/npm -e BOWER_STORAGE__CACHE=/cache/bower \
+            -v "$PWD:/workspace" \
+            -v "$GITHUB_WORKSPACE/.cache/npm:/cache/npm" \
+            -v "$GITHUB_WORKSPACE/.cache/bower:/cache/bower" \
+            -v "$GITHUB_WORKSPACE/.cache/gems:/cache/gems" \
+            -w /workspace/cds-tcamt-client node:10-buster bash -lc '
+              set -euo pipefail
+              # buster is EOL; its apt sources moved to the archive
+              sed -i -e "s|deb.debian.org/debian|archive.debian.org/debian|g" \
+                     -e "s|security.debian.org|archive.debian.org|g" \
+                     -e "/buster-updates/d" /etc/apt/sources.list
+              apt-get -o Acquire::Check-Valid-Until=false update -qq
+              apt-get install -y -qq --no-install-recommends ruby-full build-essential python make g++ ca-certificates git >/dev/null
+              export GEM_HOME=/cache/gems
+              export PATH="$GEM_HOME/bin:$PATH"
+              git config --global url."https://github.com/".insteadOf git://github.com/
+              rm -rf node_modules
+              npm install --unsafe-perm --ignore-scripts --no-package-lock
+              npm install -g bower grunt-cli
+              # ruby 2.5: modern ffi wants ruby >= 3, so pin the classic trio
+              command -v compass >/dev/null || {
+                gem install ffi -v 1.12.2 --no-document
+                gem install sass -v 3.4.25 --no-document
+                gem install multi_json -v 1.15.0 --no-document
+                gem install compass -v 1.0.3 --no-document
+              }
+              bower install --allow-root --config.interactive=false
+              grunt build || grunt build --force
+            '
+          test -f cds-tcamt-controller/src/main/webapp/index.html
+
+      - name: build war
+        run: |
+          docker run --rm \
+            -v "$PWD:/src" \
+            -v "$HOME/.m2/repository:/root/.m2/repository" \
+            -v "$HOME/.m2/settings.xml:/root/.m2/settings.xml:ro" \
+            -w /src/cds-tcamt-controller maven:3.9-eclipse-temurin-8 \
+            mvn -B -DskipTests clean install
+          # maven leaves these placeholders unfiltered; patch them inside the war
+          V=$(grep -m1 "<version>" cds-tcamt-controller/pom.xml | sed 's/[^0-9.]*//g')
+          rm -rf /tmp/warfix && mkdir -p /tmp/warfix
+          unzip -o -q cds-tcamt-controller/target/fits.war WEB-INF/classes/application.properties -d /tmp/warfix
+          sed -i -e "s/@timestamp@/$(date +%m-%d-%Y)/" -e "s/@version@/${V}/" /tmp/warfix/WEB-INF/classes/application.properties
+          WAR="$PWD/cds-tcamt-controller/target/fits.war"
+          (cd /tmp/warfix && zip -q "$WAR" WEB-INF/classes/application.properties)
+          # the war must not carry the analytics include
+          if unzip -p "$WAR" index.html | grep -q "digitalgov\|googletagmanager"; then
+            echo "analytics include made it into the war" >&2
+            exit 1
+          fi
+
+      - name: aws login
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::708499050170:role/healthit-prod-github-fits1
+          aws-region: us-east-2
+
+      - name: ecr login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: push candidate image
+        run: |
+          SHA_TAG="sha-${GITHUB_SHA::7}"
+          docker buildx build --platform linux/amd64 \
+            -t "$ECR_REPO:$SHA_TAG" -t "$ECR_REPO:candidate" --push .
+          echo "Pushed $ECR_REPO:$SHA_TAG (also tagged :candidate)."
+          echo "Nothing is deployed yet — promote the candidate from Mission Control."
