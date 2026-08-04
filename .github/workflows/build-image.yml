@@ -104,10 +104,12 @@ jobs:
               apt-get install -y -qq --no-install-recommends ruby-full build-essential python make g++ ca-certificates git >/dev/null
               export GEM_HOME=/cache/gems
               export PATH="$GEM_HOME/bin:$PATH"
-              # npm's internal git calls run with a scrubbed HOME, so a
-              # user-level rewrite never reaches them — system level does
-              git config --system url."https://github.com/".insteadOf git://github.com/
               git config --global url."https://github.com/".insteadOf git://github.com/
+              # karma-jasmine-jquery is test-only and pins a git:// URL in its
+              # registry manifest, which no longer resolves anywhere (and npm
+              # bypasses the git rewrite for it). The build never runs tests,
+              # so drop it before install.
+              node -e "const fs=require(\"fs\");const p=JSON.parse(fs.readFileSync(\"package.json\"));delete p.devDependencies[\"karma-jasmine-jquery\"];fs.writeFileSync(\"package.json\",JSON.stringify(p,null,2))"
               rm -rf node_modules
               npm install --unsafe-perm --ignore-scripts --no-package-lock
               npm install -g bower grunt-cli
