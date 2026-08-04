@@ -104,6 +104,9 @@ jobs:
               apt-get install -y -qq --no-install-recommends ruby-full build-essential python make g++ ca-certificates git >/dev/null
               export GEM_HOME=/cache/gems
               export PATH="$GEM_HOME/bin:$PATH"
+              # npm's internal git calls run with a scrubbed HOME, so a
+              # user-level rewrite never reaches them — system level does
+              git config --system url."https://github.com/".insteadOf git://github.com/
               git config --global url."https://github.com/".insteadOf git://github.com/
               rm -rf node_modules
               npm install --unsafe-perm --ignore-scripts --no-package-lock
