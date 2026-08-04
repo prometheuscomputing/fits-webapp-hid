@@ -160,6 +160,9 @@ jobs:
             -v "$HOME/.m2/settings.xml:/root/.m2/settings.xml:ro" \
             -w /src/cds-tcamt-controller maven:3.9-eclipse-temurin-8 \
             mvn -B -DskipTests clean install
+          # the container ran as root, so its outputs are root-owned on the
+          # host — take them back before patching the war
+          sudo chown -R "$(id -u):$(id -g)" cds-tcamt-controller/target
           # maven leaves these placeholders unfiltered; patch them inside the war
           V=$(grep -m1 "<version>" cds-tcamt-controller/pom.xml | sed 's/[^0-9.]*//g')
           rm -rf /tmp/warfix && mkdir -p /tmp/warfix
