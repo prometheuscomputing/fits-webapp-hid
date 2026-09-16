@@ -138,34 +138,37 @@ jobs:
         run: |
           mkdir -p "$GITHUB_WORKSPACE/.cache/npm" "$GITHUB_WORKSPACE/.cache/bower"
           chmod +x dev/in-container-compilation.sh
-          # The lockfile pins bower-installer at a git:// URL, and GitHub turned
-          # the git protocol off in 2022, so the install only resolves through a
-          # protocol rewrite. The dev image carries one in /root/.gitconfig and it
-          # works when the image is run by hand, but the first run here still went
-          # out on port 9418 and timed out, so the file is evidently not what git
-          # read on the runner. Rather than depend on it, pin HOME and write the
-          # rewrite at the start of the run; `git config -l` leaves the effective
-          # config in the log so a future failure of this class is one glance.
-          # The compilation script itself is untouched, since it is what makes
-          # the client artifact reproduce the shipped one.
+          # package-lock.json still carries bower-installer pinned to a git://
+          # URL. It is not in package.json and no grunt task references it, but
+          # npm walks the whole lockfile, and GitHub turned the git protocol off
+          # in 2022, so the install dies after seven minutes on a port 9418
+          # timeout. A checkout with node_modules already present never hits it,
+          # which is why this only shows up on a clean runner.
+          #
+          # git's own insteadOf rewrite does not help: npm spawns git with an
+          # environment that bypasses it, proven on the previous run where the
+          # rewrite was in effect and a manual ls-remote through it succeeded
+          # while npm's identical call still went out on 9418.
+          #
+          # So change the transport in the working copy right before the
+          # install. The commit is pinned by sha and is not touched, so the
+          # resolved tree is the same one the committed lockfile describes; only
+          # the protocol used to fetch it differs. The committed file is left
+          # alone so it stays the reference the client toolchain is pinned by.
+          sed -i 's|git://github.com/|git+https://github.com/|g' cds-tcamt-client/package-lock.json
+          grep -q 'git+https://github.com/bessdsv/bower-installer.git#7f9cece1e6fada50f44dc0851e1d85815cd1b4a7' cds-tcamt-client/package-lock.json
+          if grep -q 'git://' cds-tcamt-client/package-lock.json; then
+            echo "a git:// URL survived the rewrite" >&2
+            exit 1
+          fi
           docker run --rm --platform linux/amd64 \
             -e HOME=/root \
             -v "$PWD:/etc/app" \
             -v "$GITHUB_WORKSPACE/.cache/npm:/root/.npm" \
             -v "$GITHUB_WORKSPACE/.cache/bower:/root/.cache/bower" \
             -w /etc/app \
-            --entrypoint /bin/bash \
-            nist775hit/fits-dev-environment@sha256:63168e288ada129f2c2ffe97cf967b0b1658dd14241ce073f35f35faf97ecdbd \
-            -lc '
-              set -e
-              git config --global url."https://github.com/".insteadOf git://github.com/
-              echo "--- git config in effect ---"
-              git config --global -l
-              echo "--- git:// reachability through the rewrite ---"
-              git ls-remote -h git://github.com/bessdsv/bower-installer.git >/dev/null
-              echo "rewrite works"
-              ./dev/in-container-compilation.sh
-            '
+            --entrypoint ./dev/in-container-compilation.sh \
+            nist775hit/fits-dev-environment@sha256:63168e288ada129f2c2ffe97cf967b0b1658dd14241ce073f35f35faf97ecdbd
           test -f cds-tcamt-controller/src/main/webapp/index.html
 
       # War from the already-built webapp, resolving every dependency from
