@@ -138,13 +138,34 @@ jobs:
         run: |
           mkdir -p "$GITHUB_WORKSPACE/.cache/npm" "$GITHUB_WORKSPACE/.cache/bower"
           chmod +x dev/in-container-compilation.sh
+          # The lockfile pins bower-installer at a git:// URL, and GitHub turned
+          # the git protocol off in 2022, so the install only resolves through a
+          # protocol rewrite. The dev image carries one in /root/.gitconfig and it
+          # works when the image is run by hand, but the first run here still went
+          # out on port 9418 and timed out, so the file is evidently not what git
+          # read on the runner. Rather than depend on it, pin HOME and write the
+          # rewrite at the start of the run; `git config -l` leaves the effective
+          # config in the log so a future failure of this class is one glance.
+          # The compilation script itself is untouched, since it is what makes
+          # the client artifact reproduce the shipped one.
           docker run --rm --platform linux/amd64 \
+            -e HOME=/root \
             -v "$PWD:/etc/app" \
             -v "$GITHUB_WORKSPACE/.cache/npm:/root/.npm" \
             -v "$GITHUB_WORKSPACE/.cache/bower:/root/.cache/bower" \
             -w /etc/app \
-            --entrypoint ./dev/in-container-compilation.sh \
-            nist775hit/fits-dev-environment@sha256:63168e288ada129f2c2ffe97cf967b0b1658dd14241ce073f35f35faf97ecdbd
+            --entrypoint /bin/bash \
+            nist775hit/fits-dev-environment@sha256:63168e288ada129f2c2ffe97cf967b0b1658dd14241ce073f35f35faf97ecdbd \
+            -lc '
+              set -e
+              git config --global url."https://github.com/".insteadOf git://github.com/
+              echo "--- git config in effect ---"
+              git config --global -l
+              echo "--- git:// reachability through the rewrite ---"
+              git ls-remote -h git://github.com/bessdsv/bower-installer.git >/dev/null
+              echo "rewrite works"
+              ./dev/in-container-compilation.sh
+            '
           test -f cds-tcamt-controller/src/main/webapp/index.html
 
       # War from the already-built webapp, resolving every dependency from
