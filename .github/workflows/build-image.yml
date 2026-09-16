@@ -147,19 +147,28 @@ jobs:
             exit 1
           fi
           chmod +x dev/in-container-compilation.sh
-          # No cache mounts. Handing the container a host directory for
-          # /root/.npm is what dev/docker-compose-ui-compilation.yml does not
-          # do, and it is what broke the run after the transport was fixed: npm
-          # could not create /root/.npm/_cacache/tmp inside the restored
-          # directory. The mounts only ever saved downloads, the lockfile is
-          # what decides the tree, and a cold install is a few minutes on a
-          # workflow that runs per push to master. Matching the compose recipe
-          # exactly is worth more here than the minutes.
+          # No cache mounts: dev/docker-compose-ui-compilation.yml mounts the
+          # repository and nothing else, and matching that recipe is the point
+          # of building the client this way.
+          #
+          # npm 6 running as root drops to the uid that owns the package
+          # directory unless unsafe-perm is set. Under compose on a laptop the
+          # bind mount presents as root-owned so it never drops; here the
+          # checkout belongs to the runner user, so npm demotes itself and then
+          # cannot write its own cache under /root. That is the same reason the
+          # previous client recipe passed --unsafe-perm. Set it (and a cache
+          # path that is writable either way) through the environment so
+          # in-container-compilation.sh stays untouched.
           docker run --rm --platform linux/amd64 \
+            -e npm_config_unsafe_perm=true \
+            -e npm_config_cache=/tmp/npm-cache \
             -v "$PWD:/etc/app" \
             -w /etc/app \
             --entrypoint ./dev/in-container-compilation.sh \
             nist775hit/fits-dev-environment@sha256:63168e288ada129f2c2ffe97cf967b0b1658dd14241ce073f35f35faf97ecdbd
+          # the container ran as root, so its outputs are root-owned on the
+          # host; take them back so the next checkout can clean the workspace
+          sudo chown -R "$(id -u):$(id -g)" .
           test -f cds-tcamt-controller/src/main/webapp/index.html
 
       # War from the already-built webapp, resolving every dependency from
