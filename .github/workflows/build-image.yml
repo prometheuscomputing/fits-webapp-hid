@@ -3,6 +3,17 @@
 # never writes — promotion to :latest happens from Mission Control after a
 # human approves the candidate, so a push here can never change what runs
 # by itself. Full flow: aws-migration repo, docs/FITS_CICD_SPEC.md.
+#
+# The client and war are built with the same recipes cds-tcamt/Dockerfile
+# uses, so a CI artifact matches a local `docker build` of that Dockerfile.
+# Reimplementing the client build here is what broke it before. The client
+# toolchain is pinned by cds-tcamt-client/package-lock.json; installing with
+# --no-package-lock floated uglify-js from the locked 2.3.6 to 2.4.24, and
+# 2.4.24 mis-mangles angular-moment-picker's isSelectable() — the outer
+# $scope reference collides with the catch parameter, so every date picker
+# threw "Cannot read properties of undefined (reading 'isAfterOrEqualMin')"
+# and no calendar ever opened. Nothing in the build output said so, because
+# `grunt build || grunt build --force` swallowed the cdnify abort too.
 
 name: build-image
 
@@ -34,7 +45,9 @@ jobs:
 
       # All Maven traffic goes through our Nexus (anonymous read). The
       # mirrorOf=* also overrides the hardcoded repository URLs some of
-      # these poms still carry from their previous home.
+      # these poms still carry from their previous home. The sibling
+      # artifacts (hit-stats-logger, fhirLib, cds-base) are resolved from
+      # here rather than built from source, so snapshots must stay enabled.
       - name: maven settings
         working-directory: .
         run: |
@@ -85,11 +98,13 @@ jobs:
           key: m2-${{ hashFiles('**/pom.xml') }}
           restore-keys: m2-
 
+      # package-lock.json is what fixes the grunt/uglify toolchain, so it is
+      # the file that must invalidate this cache.
       - name: cache client toolchain
         uses: actions/cache@v4
         with:
           path: .cache
-          key: client-${{ hashFiles('cds-tcamt/cds-tcamt-client/package.json', 'cds-tcamt/cds-tcamt-client/bower.json') }}
+          key: client-${{ hashFiles('cds-tcamt/cds-tcamt-client/package-lock.json', 'cds-tcamt/cds-tcamt-client/bower.json') }}
           restore-keys: client-
 
       # The DAP include reports usage to the federal analytics program and
@@ -107,51 +122,36 @@ jobs:
             exit 1
           fi
 
-      # Angular client. grunt 0.4 / graceful-fs@3 breaks on newer node
-      # ("primordials is not defined") so this needs node 10, and the sass
-      # toolchain needs the pinned ruby gems. Same container recipe the
-      # local builds use.
+      # Angular client, built exactly the way cds-tcamt/Dockerfile stage 1 and
+      # dev/docker-compose-ui-compilation.yml build it: the dev image at
+      # /etc/app running dev/in-container-compilation.sh. That image carries
+      # the node 8 / compass / phantomjs / git-protocol-rewrite setup this
+      # 2016-era toolchain needs, and the script's plain `npm install` honours
+      # package-lock.json — which is what holds uglify-js at 2.3.6 and makes
+      # this build reproduce the master artifact byte for byte (scripts.js and
+      # main.css hash identically to the shipped nist775hit/fits-webapp image).
+      # Do not add --no-package-lock here; see the header for what that broke.
+      #
+      # The cache mounts only save downloads; they are keyed by resolved
+      # version, so the lockfile still decides what gets installed.
       - name: build client
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/.cache/npm" "$GITHUB_WORKSPACE/.cache/bower" "$GITHUB_WORKSPACE/.cache/gems"
-          docker run --rm \
-            -e CI=true -e PHANTOMJS_SKIP_DOWNLOAD=true \
-            -e NPM_CONFIG_CACHE=/cache/npm -e BOWER_STORAGE__CACHE=/cache/bower \
-            -v "$PWD:/workspace" \
-            -v "$GITHUB_WORKSPACE/.cache/npm:/cache/npm" \
-            -v "$GITHUB_WORKSPACE/.cache/bower:/cache/bower" \
-            -v "$GITHUB_WORKSPACE/.cache/gems:/cache/gems" \
-            -w /workspace/cds-tcamt-client node:10-buster bash -lc '
-              set -euo pipefail
-              # buster is EOL; its apt sources moved to the archive
-              sed -i -e "s|deb.debian.org/debian|archive.debian.org/debian|g" \
-                     -e "s|security.debian.org|archive.debian.org|g" \
-                     -e "/buster-updates/d" /etc/apt/sources.list
-              apt-get -o Acquire::Check-Valid-Until=false update -qq
-              apt-get install -y -qq --no-install-recommends ruby-full build-essential python make g++ ca-certificates git >/dev/null
-              export GEM_HOME=/cache/gems
-              export PATH="$GEM_HOME/bin:$PATH"
-              git config --global url."https://github.com/".insteadOf git://github.com/
-              # karma-jasmine-jquery is test-only and pins a git:// URL in its
-              # registry manifest, which no longer resolves anywhere (and npm
-              # bypasses the git rewrite for it). The build never runs tests,
-              # so drop it before install.
-              node -e "const fs=require(\"fs\");const p=JSON.parse(fs.readFileSync(\"package.json\"));delete p.devDependencies[\"karma-jasmine-jquery\"];fs.writeFileSync(\"package.json\",JSON.stringify(p,null,2))"
-              rm -rf node_modules
-              npm install --unsafe-perm --ignore-scripts --no-package-lock
-              npm install -g bower grunt-cli
-              # ruby 2.5: modern ffi wants ruby >= 3, so pin the classic trio
-              command -v compass >/dev/null || {
-                gem install ffi -v 1.12.2 --no-document
-                gem install sass -v 3.4.25 --no-document
-                gem install multi_json -v 1.15.0 --no-document
-                gem install compass -v 1.0.3 --no-document
-              }
-              bower install --allow-root --config.interactive=false
-              grunt build || grunt build --force
-            '
+          mkdir -p "$GITHUB_WORKSPACE/.cache/npm" "$GITHUB_WORKSPACE/.cache/bower"
+          chmod +x dev/in-container-compilation.sh
+          docker run --rm --platform linux/amd64 \
+            -v "$PWD:/etc/app" \
+            -v "$GITHUB_WORKSPACE/.cache/npm:/root/.npm" \
+            -v "$GITHUB_WORKSPACE/.cache/bower:/root/.cache/bower" \
+            -w /etc/app \
+            --entrypoint ./dev/in-container-compilation.sh \
+            nist775hit/fits-dev-environment@sha256:63168e288ada129f2c2ffe97cf967b0b1658dd14241ce073f35f35faf97ecdbd
           test -f cds-tcamt-controller/src/main/webapp/index.html
 
+      # War from the already-built webapp, resolving every dependency from
+      # Nexus. Note the placeholder patching below is now a no-op: commit
+      # 7f378ce fixed the duplicate unfiltered resource pass in the controller
+      # pom, so maven already emits a real app.version/app.date. It is kept as
+      # a belt-and-braces guard and costs nothing.
       - name: build war
         run: |
           docker run --rm \
@@ -189,12 +189,12 @@ jobs:
         run: |
           # The repo's own Dockerfile compiles everything inside the image
           # build (handy on a laptop, redundant here — the client and war are
-          # already built above). The image for deployment is assembly-only:
-          # tomcat + error pages + the war + the deployment branding, pinned
-          # at .github/docker/Dockerfile so changes to the repo Dockerfile
-          # can't alter what ships. The context is the repository root so the
-          # branding files under .github/docker/brand are reachable; the root
-          # .dockerignore keeps everything else out of it.
+          # already built above with its exact recipe for the client). The image for
+          # deployment is assembly-only: tomcat + error pages + the war + the
+          # deployment branding, pinned at .github/docker/Dockerfile so changes
+          # to the repo Dockerfile can't alter what ships. The context is the
+          # repository root so the branding files under .github/docker/brand
+          # are reachable; the root .dockerignore keeps everything else out.
           SHA_TAG="sha-${GITHUB_SHA::7}"
           docker buildx build --platform linux/amd64 \
             -f "$GITHUB_WORKSPACE/.github/docker/Dockerfile" \
