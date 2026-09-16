@@ -98,15 +98,6 @@ jobs:
           key: m2-${{ hashFiles('**/pom.xml') }}
           restore-keys: m2-
 
-      # package-lock.json is what fixes the grunt/uglify toolchain, so it is
-      # the file that must invalidate this cache.
-      - name: cache client toolchain
-        uses: actions/cache@v4
-        with:
-          path: .cache
-          key: client-${{ hashFiles('cds-tcamt/cds-tcamt-client/package-lock.json', 'cds-tcamt/cds-tcamt-client/bower.json') }}
-          restore-keys: client-
-
       # The DAP include reports usage to the federal analytics program and
       # has no place on our hosting. Strip it from the sources before the
       # client build so no build output can carry it.
@@ -136,36 +127,36 @@ jobs:
       # version, so the lockfile still decides what gets installed.
       - name: build client
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/.cache/npm" "$GITHUB_WORKSPACE/.cache/bower"
-          chmod +x dev/in-container-compilation.sh
           # package-lock.json still carries bower-installer pinned to a git://
           # URL. It is not in package.json and no grunt task references it, but
           # npm walks the whole lockfile, and GitHub turned the git protocol off
-          # in 2022, so the install dies after seven minutes on a port 9418
-          # timeout. A checkout with node_modules already present never hits it,
-          # which is why this only shows up on a clean runner.
-          #
-          # git's own insteadOf rewrite does not help: npm spawns git with an
-          # environment that bypasses it, proven on the previous run where the
-          # rewrite was in effect and a manual ls-remote through it succeeded
-          # while npm's identical call still went out on 9418.
-          #
-          # So change the transport in the working copy right before the
-          # install. The commit is pinned by sha and is not touched, so the
-          # resolved tree is the same one the committed lockfile describes; only
-          # the protocol used to fetch it differs. The committed file is left
-          # alone so it stays the reference the client toolchain is pinned by.
+          # in 2022, so the install dies on a port 9418 timeout. A working copy
+          # that already has node_modules never reaches out for it, which is why
+          # this only shows up on a clean runner. git's own insteadOf rewrite
+          # does not help: npm spawns git in a way that bypasses it, proven on
+          # an earlier run where the rewrite was in effect and a manual
+          # ls-remote through it succeeded while npm's identical call still went
+          # out on 9418. The commit is pinned by sha and is untouched, so the
+          # resolved tree is the one the committed lockfile describes and only
+          # the transport differs. The committed file is left alone so it stays
+          # the reference the client toolchain is pinned by.
           sed -i 's|git://github.com/|git+https://github.com/|g' cds-tcamt-client/package-lock.json
           grep -q 'git+https://github.com/bessdsv/bower-installer.git#7f9cece1e6fada50f44dc0851e1d85815cd1b4a7' cds-tcamt-client/package-lock.json
           if grep -q 'git://' cds-tcamt-client/package-lock.json; then
             echo "a git:// URL survived the rewrite" >&2
             exit 1
           fi
+          chmod +x dev/in-container-compilation.sh
+          # No cache mounts. Handing the container a host directory for
+          # /root/.npm is what dev/docker-compose-ui-compilation.yml does not
+          # do, and it is what broke the run after the transport was fixed: npm
+          # could not create /root/.npm/_cacache/tmp inside the restored
+          # directory. The mounts only ever saved downloads, the lockfile is
+          # what decides the tree, and a cold install is a few minutes on a
+          # workflow that runs per push to master. Matching the compose recipe
+          # exactly is worth more here than the minutes.
           docker run --rm --platform linux/amd64 \
-            -e HOME=/root \
             -v "$PWD:/etc/app" \
-            -v "$GITHUB_WORKSPACE/.cache/npm:/root/.npm" \
-            -v "$GITHUB_WORKSPACE/.cache/bower:/root/.cache/bower" \
             -w /etc/app \
             --entrypoint ./dev/in-container-compilation.sh \
             nist775hit/fits-dev-environment@sha256:63168e288ada129f2c2ffe97cf967b0b1658dd14241ce073f35f35faf97ecdbd
