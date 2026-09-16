@@ -147,29 +147,32 @@ jobs:
             exit 1
           fi
           chmod +x dev/in-container-compilation.sh
-          # No cache mounts: dev/docker-compose-ui-compilation.yml mounts the
-          # repository and nothing else, and matching that recipe is the point
-          # of building the client this way.
+          # Run it the way dev/docker-compose-ui-compilation.yml does: the
+          # repository mounted at /etc/app and nothing else.
           #
-          # npm 6 running as root drops to the uid that owns the package
-          # directory unless unsafe-perm is set. Under compose on a laptop the
-          # bind mount presents as root-owned so it never drops; here the
-          # checkout belongs to the runner user, so npm demotes itself and then
-          # cannot write its own cache under /root. That is the same reason the
-          # previous client recipe passed --unsafe-perm. Set it (and a cache
-          # path that is writable either way) through the environment so
-          # in-container-compilation.sh stays untouched.
+          # The one thing a runner cannot reproduce on its own is ownership.
+          # npm 6 running as root infers the owner of the package directory and
+          # drops to that uid for its cache and for the git subprocesses it
+          # spawns. On a laptop the bind mount presents as root-owned so npm
+          # stays root; here the checkout belongs to the runner user, npm
+          # demotes itself, and the install dies partway through cloning. The
+          # npm_config_unsafe_perm and npm_config_cache knobs only moved the
+          # failure, because the demotion also applies to the clone. Giving the
+          # tree to root for the duration of the container is what actually
+          # matches the environment the recipe was written for.
+          sudo chown -R 0:0 .
+          rc=0
           docker run --rm --platform linux/amd64 \
-            -e npm_config_unsafe_perm=true \
-            -e npm_config_cache=/tmp/npm-cache \
             -v "$PWD:/etc/app" \
             -w /etc/app \
             --entrypoint ./dev/in-container-compilation.sh \
-            nist775hit/fits-dev-environment@sha256:63168e288ada129f2c2ffe97cf967b0b1658dd14241ce073f35f35faf97ecdbd
-          # the container ran as root, so its outputs are root-owned on the
-          # host; take them back so the next checkout can clean the workspace
+            nist775hit/fits-dev-environment@sha256:63168e288ada129f2c2ffe97cf967b0b1658dd14241ce073f35f35faf97ecdbd || rc=$?
+          # hand the tree back whether or not the build worked, so a failed run
+          # does not leave a workspace the next checkout cannot clean
           sudo chown -R "$(id -u):$(id -g)" .
-          test -f cds-tcamt-controller/src/main/webapp/index.html
+          exit $rc
+      - name: client artifact present
+        run: test -f cds-tcamt-controller/src/main/webapp/index.html
 
       # War from the already-built webapp, resolving every dependency from
       # Nexus. Note the placeholder patching below is now a no-op: commit
