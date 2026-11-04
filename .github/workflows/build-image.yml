@@ -95,8 +95,47 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.m2/repository
-          key: m2-${{ hashFiles('**/pom.xml') }}
+          # dependencies.json pins the sibling artifacts built below, so
+          # re-pinning one has to invalidate this cache
+          key: m2-${{ hashFiles('**/pom.xml', 'cds-tcamt/cds-tcamt-controller/dependencies.json') }}
           restore-keys: m2-
+
+      # Not every sibling artifact is published to Nexus, so hit-stats-logger,
+      # fhirLib and cds-base are built from source here, in the order
+      # cds-tcamt-controller/dependencies.json lists them and at the commit it
+      # pins. That is the same file dependencies.sh reads, so adding or
+      # re-pinning a dependency needs no change to this workflow. Each build
+      # installs into the ~/.m2 cache above, where the war build picks it up;
+      # anything not listed still resolves from Nexus. actions/checkout cannot
+      # be looped, so this clones directly, and the builds run in the same
+      # maven:3.9-eclipse-temurin-8 image as the war so they see the same JDK.
+      - name: build dependencies from dependencies.json
+        run: |
+          set -euo pipefail
+          rm -rf temp-dependencies && mkdir -p temp-dependencies
+          jq -c '.dependencies[]' cds-tcamt-controller/dependencies.json | while read -r dep; do
+            name=$(jq -r '.name' <<<"$dep")
+            repository=$(jq -r '.repository' <<<"$dep")
+            sha1=$(jq -r '.sha1' <<<"$dep")
+            cmd=$(jq -r '.cmd' <<<"$dep")
+            dir=$(basename "$repository" .git)
+
+            echo "::group::$name ($repository @ $sha1)"
+            git clone --quiet "$repository" "temp-dependencies/$dir"
+            git -C "temp-dependencies/$dir" checkout --quiet "$sha1"
+            # the json's cmd runs tests; CI only needs the artifacts installed
+            docker run --rm \
+              -v "$PWD/temp-dependencies:/src" \
+              -v "$HOME/.m2/repository:/root/.m2/repository" \
+              -v "$HOME/.m2/settings.xml:/root/.m2/settings.xml:ro" \
+              -w "/src/$dir" maven:3.9-eclipse-temurin-8 \
+              $cmd -B -DskipTests
+            echo "::endgroup::"
+          done
+          # the container ran as root, so both the clones and the new ~/.m2
+          # entries are root-owned on the host
+          sudo chown -R "$(id -u):$(id -g)" "$HOME/.m2/repository"
+          sudo rm -rf temp-dependencies # keeps the runner (and docker context) clean
 
       # The DAP include reports usage to the federal analytics program and
       # has no place on our hosting. Strip it from the sources before the
